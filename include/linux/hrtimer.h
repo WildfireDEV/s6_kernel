@@ -5,7 +5,6 @@
  *
  *   Copyright(C) 2005, Thomas Gleixner <tglx@linutronix.de>
  *   Copyright(C) 2005, Red Hat, Inc., Ingo Molnar
- *   Copyright (C) 2014, NVIDIA CORPORATION.  All rights reserved.
  *
  *  data type definitions, declarations, prototypes
  *
@@ -24,7 +23,6 @@
 #include <linux/percpu.h>
 #include <linux/timer.h>
 #include <linux/timerqueue.h>
-#include <asm/relaxed.h>
 
 struct hrtimer_clock_base;
 struct hrtimer_cpu_base;
@@ -98,11 +96,11 @@ enum hrtimer_restart {
  * @function:	timer expiry callback function
  * @base:	pointer to the timer base (per cpu and per clock)
  * @state:	state information (See bit values above)
+ * @start_pid: timer statistics field to store the pid of the task which
+ *		started the timer
  * @start_site:	timer statistics field to store the site where the timer
  *		was started
  * @start_comm: timer statistics field to store the name of the process which
- *		started the timer
- * @start_pid: timer statistics field to store the pid of the task which
  *		started the timer
  *
  * The hrtimer structure must be initialized by hrtimer_init()
@@ -118,6 +116,7 @@ struct hrtimer {
 	void				*start_site;
 	char				start_comm[16];
 #endif
+	bool				bounded_to_boot_cluster;
 };
 
 /**
@@ -167,6 +166,7 @@ enum  hrtimer_base_type {
  * struct hrtimer_cpu_base - the per cpu clock bases
  * @lock:		lock protecting the base and associated clock bases
  *			and timers
+ * @cpu:		cpu number
  * @active_bases:	Bitfield to mark bases with active timers
  * @clock_was_set:	Indicates that clock was set from irq context.
  * @expires_next:	absolute time of the next event which was scheduled
@@ -181,6 +181,7 @@ enum  hrtimer_base_type {
  */
 struct hrtimer_cpu_base {
 	raw_spinlock_t			lock;
+	unsigned int			cpu;
 	unsigned int			active_bases;
 	unsigned int			clock_was_set;
 #ifdef CONFIG_HIGH_RES_TIMERS
@@ -326,14 +327,6 @@ static inline void timerfd_clock_was_set(void) { }
 #endif
 extern void hrtimers_resume(void);
 
-extern ktime_t ktime_get(void);
-extern ktime_t ktime_get_real(void);
-extern ktime_t ktime_get_boottime(void);
-extern ktime_t ktime_get_monotonic_offset(void);
-extern ktime_t ktime_get_clocktai(void);
-extern ktime_t ktime_get_update_offsets(ktime_t *offs_real, ktime_t *offs_boot,
-					 ktime_t *offs_tai);
-
 DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
 
 
@@ -418,11 +411,6 @@ static inline int hrtimer_is_queued(struct hrtimer *timer)
 static inline int hrtimer_callback_running(struct hrtimer *timer)
 {
 	return timer->state & HRTIMER_STATE_CALLBACK;
-}
-
-static inline int hrtimer_callback_running_relaxed(struct hrtimer *timer)
-{
-	return cpu_relaxed_read_long(&timer->state) & HRTIMER_STATE_CALLBACK;
 }
 
 /* Forward a hrtimer so it expires after now: */

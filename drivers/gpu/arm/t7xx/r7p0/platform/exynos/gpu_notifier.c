@@ -18,8 +18,6 @@
 
 #include <linux/suspend.h>
 #include <linux/pm_runtime.h>
-#include <mach/apm-exynos.h>
-#include <mach/asv-exynos.h>
 
 #include "mali_kbase_platform.h"
 #include "gpu_dvfs_handler.h"
@@ -27,21 +25,27 @@
 #include "gpu_control.h"
 
 #ifdef CONFIG_EXYNOS_THERMAL
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
 #include <mach/tmu.h>
+#else
+#include <soc/samsung/tmu.h>
+#endif
 #endif /* CONFIG_EXYNOS_THERMAL */
 
-#ifdef CONFIG_EXYNOS_NOC_DEBUGGING
-#include <linux/exynos-noc.h>
+#ifdef CONFIG_EXYNOS_BUSMONITOR
+#include <linux/exynos-busmon.h>
 #endif
 extern struct kbase_device *pkbdev;
 
-#ifdef CONFIG_EXYNOS_THERMAL
-static int gpu_tmu_hot_check_and_work(struct kbase_device *kbdev, unsigned long event)
-{
+#if defined (CONFIG_EXYNOS_THERMAL) && defined(CONFIG_GPU_THERMAL)
+static int gpu_tmu_hot_check_and_work(struct kbase_device *kbdev,
+		unsigned long event, unsigned long index) {
 #ifdef CONFIG_MALI_DVFS
 	struct exynos_context *platform;
 	int lock_clock;
-
+#ifdef CONFIG_EXYNOS_SNAPSHOT_THERMAL
+	char *cooling_device_name = "GPU";
+#endif
 	KBASE_DEBUG_ASSERT(kbdev != NULL);
 
 	platform = (struct exynos_context *)kbdev->platform_context;
@@ -49,28 +53,18 @@ static int gpu_tmu_hot_check_and_work(struct kbase_device *kbdev, unsigned long 
 		return -ENODEV;
 
 	switch (event) {
-	case GPU_THROTTLING1:
-		lock_clock = platform->tmu_lock_clk[THROTTLING1];
-		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "THROTTLING1\n");
-		break;
-	case GPU_THROTTLING2:
-		lock_clock = platform->tmu_lock_clk[THROTTLING2];
-		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "THROTTLING2\n");
-		break;
-	case GPU_THROTTLING3:
-		lock_clock = platform->tmu_lock_clk[THROTTLING3];
-		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "THROTTLING3\n");
-		break;
-	case GPU_THROTTLING4:
-		lock_clock = platform->tmu_lock_clk[THROTTLING4];
-		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "THROTTLING4\n");
+	case GPU_THROTTLING:
+		lock_clock = platform->tmu_lock_clk[index];
+		exynos_ss_thermal(NULL, 0, cooling_device_name, lock_clock);
+		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "THROTTLING[%lu]\n", index);
 		break;
 	case GPU_TRIPPING:
 		lock_clock = platform->tmu_lock_clk[TRIPPING];
 		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "TRIPPING\n");
 		break;
 	default:
-		GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "%s: wrong event, %lu\n", __func__, event);
+		GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u,
+			"%s: wrong event, %lu\n", __func__, event);
 		return 0;
 	}
 
@@ -93,6 +87,7 @@ static void gpu_tmu_normal_work(struct kbase_device *kbdev)
 static int gpu_tmu_notifier(struct notifier_block *notifier,
 				unsigned long event, void *v)
 {
+	unsigned long index;
 	struct exynos_context *platform = (struct exynos_context *)pkbdev->platform_context;
 	if (!platform)
 		return -ENODEV;
@@ -101,17 +96,18 @@ static int gpu_tmu_notifier(struct notifier_block *notifier,
 		return NOTIFY_OK;
 
 	platform->voltage_margin = 0;
+	index = *(unsigned long*)v;
 
 	if (event == GPU_COLD) {
 		platform->voltage_margin = platform->gpu_default_vol_margin;
 	} else if (event == GPU_NORMAL) {
 		gpu_tmu_normal_work(pkbdev);
-	} else if (event >= GPU_THROTTLING1 && event <= GPU_TRIPPING) {
-		if (gpu_tmu_hot_check_and_work(pkbdev, event))
+	} else if (event == GPU_THROTTLING || event == GPU_TRIPPING) {
+		if (gpu_tmu_hot_check_and_work(pkbdev, event, index))
 			GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "%s: failed to open device", __func__);
 	}
 
-	GPU_LOG(DVFS_DEBUG, LSI_TMU_VALUE, 0u, event, "tmu event %ld\n", event);
+	GPU_LOG(DVFS_DEBUG, LSI_TMU_VALUE, 0u, event, "tmu event %lu, level %lu\n", event, index);
 
 	gpu_set_target_clk_vol(platform->cur_clock, false);
 
@@ -122,41 +118,6 @@ static struct notifier_block gpu_tmu_nb = {
 	.notifier_call = gpu_tmu_notifier,
 };
 #endif /* CONFIG_EXYNOS_THERMAL */
-
-#ifdef CONFIG_MALI_RT_PM
-extern int kbase_device_suspend(struct kbase_device *kbdev);
-extern int kbase_device_resume(struct kbase_device *kbdev);
-
-static int gpu_pm_notifier(struct notifier_block *nb, unsigned long event, void *cmd)
-{
-	int err = NOTIFY_OK;
-	struct kbase_device *kbdev = pkbdev;
-
-	switch (event) {
-	case PM_SUSPEND_PREPARE:
-		if (kbdev)
-			kbase_device_suspend(kbdev);
-		GPU_LOG(DVFS_DEBUG, LSI_SUSPEND, 0u, 0u, "%s: suspend event\n", __func__);
-		break;
-	case PM_POST_SUSPEND:
-		if (kbdev)
-			kbase_device_resume(kbdev);
-		GPU_LOG(DVFS_DEBUG, LSI_RESUME, 0u, 0u, "%s: resume event\n", __func__);
-		break;
-	default:
-		break;
-	}
-	return err;
-}
-
-static int gpu_noc_notifier(struct notifier_block *nb, unsigned long event, void *cmd)
-{
-	if (strstr((char *)cmd, "G3D")) {
-		GPU_LOG(DVFS_ERROR, LSI_RESUME, 0u, 0u, "%s: gpu_noc_notifier\n", __func__);
-		gpu_register_dump();
-	}
-	return 0;
-}
 
 static int gpu_power_on(struct kbase_device *kbdev)
 {
@@ -214,12 +175,34 @@ static void gpu_power_suspend(struct kbase_device *kbdev)
 		gpu_control_disable_clock(kbdev);
 }
 
+#ifdef CONFIG_MALI_RT_PM
+extern int kbase_device_suspend(struct kbase_device *kbdev);
+extern int kbase_device_resume(struct kbase_device *kbdev);
+
+static int gpu_pm_notifier(struct notifier_block *nb, unsigned long event, void *cmd)
+{
+	int err = NOTIFY_OK;
+	struct kbase_device *kbdev = pkbdev;
+
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		if (kbdev)
+			kbase_device_suspend(kbdev);
+		GPU_LOG(DVFS_DEBUG, LSI_SUSPEND, 0u, 0u, "%s: suspend event\n", __func__);
+		break;
+	case PM_POST_SUSPEND:
+		if (kbdev)
+			kbase_device_resume(kbdev);
+		GPU_LOG(DVFS_DEBUG, LSI_RESUME, 0u, 0u, "%s: resume event\n", __func__);
+		break;
+	default:
+		break;
+	}
+	return err;
+}
+
 static struct notifier_block gpu_pm_nb = {
 	.notifier_call = gpu_pm_notifier
-};
-
-static struct notifier_block gpu_noc_nb = {
-	.notifier_call = gpu_noc_notifier
 };
 
 static int gpu_device_runtime_init(struct kbase_device *kbdev)
@@ -255,11 +238,12 @@ static int pm_callback_change_dvfs_level(struct kbase_device *kbdev)
 
 	if(kbdev->vendor_callbacks->get_poweron_dbg)
 		enabledebug = kbdev->vendor_callbacks->get_poweron_dbg();
-
+#if 0
 	if (enabledebug)
 		GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "asv table[%u] clk[%d to %d]MHz, vol[%d (margin : %d) real: %d]mV\n",
 				exynos_get_table_ver(), gpu_get_cur_clock(platform), platform->gpu_dvfs_start_clock,
 				gpu_get_cur_voltage(platform), platform->voltage_margin, platform->cur_voltage);
+#endif
 	gpu_set_target_clk_vol(platform->gpu_dvfs_start_clock, false);
 	gpu_dvfs_reset_env_data(kbdev);
 #endif
@@ -274,9 +258,9 @@ static int pm_callback_runtime_on(struct kbase_device *kbdev)
 
 	GPU_LOG(DVFS_INFO, LSI_GPU_ON, 0u, 0u, "runtime on callback\n");
 
-	platform->power_status = true;
 	gpu_control_enable_clock(kbdev);
 	gpu_dvfs_start_env_data_gathering(kbdev);
+	platform->power_status = true;
 #ifdef CONFIG_MALI_DVFS
 	if (platform->dvfs_status && platform->wakeup_lock)
 		gpu_set_target_clk_vol(platform->gpu_dvfs_start_clock, false);
@@ -284,9 +268,10 @@ static int pm_callback_runtime_on(struct kbase_device *kbdev)
 #endif /* CONFIG_MALI_DVFS */
 		gpu_set_target_clk_vol(platform->cur_clock, false);
 
-#ifdef CONFIG_MALI_DVFS_USER
+#ifdef CONFIG_MALI_DVFS_USER_GOVERNOR
 	gpu_dvfs_notify_poweron();
 #endif
+
 	return 0;
 }
 extern void preload_balance_setup(struct kbase_device *kbdev);
@@ -298,11 +283,15 @@ static void pm_callback_runtime_off(struct kbase_device *kbdev)
 
 	GPU_LOG(DVFS_INFO, LSI_GPU_OFF, 0u, 0u, "runtime off callback\n");
 
-#ifdef CONFIG_MALI_DVFS_USER
+#ifdef CONFIG_MALI_DVFS_USER_GOVERNOR
 	gpu_dvfs_notify_poweroff();
 #endif
 
 	platform->power_status = false;
+
+	mutex_lock(&platform->gpu_clock_lock);
+	gpu_disable_dvs(platform);
+	mutex_unlock(&platform->gpu_clock_lock);
 
 	gpu_dvfs_stop_env_data_gathering(kbdev);
 #ifdef CONFIG_MALI_DVFS
@@ -313,10 +302,11 @@ static void pm_callback_runtime_off(struct kbase_device *kbdev)
 	if (!platform->early_clk_gating_status)
 		gpu_control_disable_clock(kbdev);
 
-#if defined(CONFIG_SOC_EXYNOS7420)
+#if defined(CONFIG_SOC_EXYNOS7420) || defined(CONFIG_SOC_EXYNOS7890)
 	preload_balance_setup(kbdev);
 #endif
 }
+#endif /* CONFIG_MALI_RT_PM */
 
 struct kbase_pm_callback_conf pm_callbacks = {
 	.power_on_callback = gpu_power_on,
@@ -338,7 +328,23 @@ struct kbase_pm_callback_conf pm_callbacks = {
 	.power_change_dvfs_level_callback = NULL,
 #endif /* CONFIG_MALI_RT_PM */
 };
-#endif /* CONFIG_MALI_RT_PM */
+
+#ifdef CONFIG_EXYNOS_BUSMONITOR
+static int gpu_noc_notifier(struct notifier_block *nb, unsigned long event, void *cmd)
+{
+	if (strstr((char *)cmd, "G3D")) {
+		GPU_LOG(DVFS_ERROR, LSI_RESUME, 0u, 0u, "%s: gpu_noc_notifier\n", __func__);
+		gpu_register_dump();
+	}
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_EXYNOS_BUSMONITOR
+static struct notifier_block gpu_noc_nb = {
+	.notifier_call = gpu_noc_notifier
+};
+#endif
 
 int gpu_notifier_init(struct kbase_device *kbdev)
 {
@@ -356,8 +362,8 @@ int gpu_notifier_init(struct kbase_device *kbdev)
 		return -1;
 #endif /* CONFIG_MALI_RT_PM */
 
-#ifdef CONFIG_EXYNOS_NOC_DEBUGGING
-	noc_notifier_chain_register(&gpu_noc_nb);
+#ifdef CONFIG_EXYNOS_BUSMONITOR
+	busmon_notifier_chain_register(&gpu_noc_nb);
 #endif
 	pm_runtime_enable(kbdev->dev);
 
