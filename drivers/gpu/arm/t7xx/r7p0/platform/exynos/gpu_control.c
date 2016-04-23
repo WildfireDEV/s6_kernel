@@ -17,29 +17,14 @@
 
 #include <mali_kbase.h>
 
-#include <linux/of_device.h>
 #include <linux/pm_qos.h>
-#include <linux/pm_domain.h>
-#include <linux/clk.h>
-#if defined(CONFIG_SOC_EXYNOS8890) && defined(CONFIG_PWRCAL)
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-#include <../pwrcal/pwrcal.h>
-#include <../pwrcal/S5E8890/S5E8890-vclk.h>
-#include <mach/pm_domains-cal.h>
-#else
-#include <../../../../../soc/samsung/pwrcal/pwrcal.h>
-#include <../../../../../soc/samsung/pwrcal/S5E8890/S5E8890-vclk.h>
-#include <../../../../../soc/samsung/pwrcal/S5E8890/S5E8890-vclk-internal.h>
-#include <soc/samsung/pm_domains-cal.h>
-#endif /* LINUX_VERSION */
-#endif /* CONFIG_SOC_EXYNOS8890 && CONFIG_PWRCAL */
+#include <mach/pm_domains.h>
 
 #include "mali_kbase_platform.h"
 #include "gpu_dvfs_handler.h"
 #include "gpu_control.h"
 
 static struct gpu_control_ops *ctr_ops;
-extern struct regulator *g3d_m_regulator;
 
 #ifdef CONFIG_MALI_RT_PM
 static struct exynos_pm_domain *gpu_get_pm_domain(void)
@@ -64,6 +49,18 @@ static struct exynos_pm_domain *gpu_get_pm_domain(void)
 	return pd;
 }
 #endif /* CONFIG_MALI_RT_PM */
+
+int get_cpu_clock_speed(u32 *cpu_clock)
+{
+	struct clk *cpu_clk;
+	u32 freq = 0;
+	cpu_clk = clk_get(NULL, "armclk");
+	if (IS_ERR(cpu_clk))
+		return -1;
+	freq = clk_get_rate(cpu_clk);
+	*cpu_clock = (freq/MHZ);
+	return 0;
+}
 
 int gpu_control_set_voltage(struct kbase_device *kbdev, int voltage)
 {
@@ -101,25 +98,6 @@ int gpu_control_set_voltage(struct kbase_device *kbdev, int voltage)
 	prev_voltage = voltage;
 
 	return ret;
-}
-
-int gpu_control_set_m_voltage(struct kbase_device *kbdev, int clk)
-{
-	int level;
-	int m_vol;
-	gpu_dvfs_info *dvfs_table;
-	struct exynos_context *platform = (struct exynos_context *) kbdev->platform_context;
-
-	dvfs_table = platform->table;
-	level = gpu_dvfs_get_level(clk);
-	m_vol = dvfs_table[level].g3dm_voltage;
-
-	if (regulator_set_voltage(g3d_m_regulator, m_vol, m_vol) != 0) {
-		GPU_LOG(DVFS_ERROR, DUMMY, 0u, 0u, "%s: failed to set m_voltage, voltage: %d\n", __func__, m_vol);
-		return -1;
-	}
-
-	return 0;
 }
 
 int gpu_control_set_clock(struct kbase_device *kbdev, int clock)
@@ -252,8 +230,8 @@ int gpu_control_enable_customization(struct kbase_device *kbdev)
 	if (ctr_ops->set_clock_to_osc)
 		ctr_ops->set_clock_to_osc(platform);
 
-	ret = gpu_enable_dvs(platform);
 	platform->dvs_is_enabled = true;
+	ret = gpu_enable_dvs(platform);
 
 	mutex_unlock(&platform->gpu_clock_lock);
 #endif /* CONFIG_REGULATOR */
@@ -321,13 +299,6 @@ int gpu_control_module_init(struct kbase_device *kbdev)
 		goto out;
 	}
 #endif /* CONFIG_REGULATOR */
-
-#ifdef CONFIG_SOC_EXYNOS8890
-	if (platform->gpu_max_clock == 0) {
-		platform->gpu_max_clock = (u32)cal_dfs_get_max_freq(dvfs_g3d) / 1000;
-		GPU_LOG(DVFS_INFO, DUMMY, 0u, 0u, "Board. Max clock limit %d.\n", platform->gpu_max_clock);
-	}
-#endif
 
 	return 0;
 out:
